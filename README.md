@@ -179,5 +179,6 @@ cast call <contract_address> "functionName()" --rpc-url $ETH_RPC_URL
 
 This project is licensed under the **MIT License**
 
+Created With :heart:
 
 
