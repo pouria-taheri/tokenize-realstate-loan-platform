@@ -1,0 +1,479 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+import "../src/RealEstateToken.sol";
+import "../src/RealEstateDeployer.sol";
+
+contract RealEstateTokenTest is Test {
+    RealEstateToken public token;
+    RealEstateDeployer public deployer;
+    
+    address public admin;
+    address public user1;
+    address public user2;
+    address public propertyManager;
+    
+    // Test configuration
+    string constant PROPERTY_ADDRESS = "123 Main St";
+    string constant DESCRIPTION = "2 bedroom apartment";
+    uint256 constant TOTAL_SHARES = 100;
+    uint256 constant PRICE_PER_SHARE = 1 ether;
+    string constant PROPERTY_URI = "ipfs://QmExample...";
+    
+    event KYCStatusUpdated(address indexed user, bool status);
+    event PropertyRented(address indexed tenant, uint256 startTime, uint256 endTime, uint256 amount);
+    event RentDistributed(uint256 totalAmount, uint256 timestamp);
+    event MaintenanceFeeDeducted(uint256 amount, string description);
+
+    function setUp() public {
+        // Setup accounts
+        admin = address(this);
+        user1 = makeAddr("user1");
+        user2 = makeAddr("user2");
+        propertyManager = makeAddr("propertyManager");
+        
+        // Fund test accounts
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
+        
+        // Deploy contracts
+        token = new RealEstateToken(
+            PROPERTY_ADDRESS,
+            DESCRIPTION,
+            TOTAL_SHARES,
+            PRICE_PER_SHARE,
+            PROPERTY_URI,
+            admin
+        );
+        
+        deployer = new RealEstateDeployer();
+    }
+
+    // KYC Tests
+    function testSetKYCStatus() public {
+        vm.expectEmit(true, true, false, true);
+        emit KYCStatusUpdated(user1, true);
+        
+        token.setKYCStatus(user1, true);
+        assertTrue(token.kycApproved(user1));
+    }
+
+    function testFailSetKYCStatusUnauthorized() public {
+        vm.prank(user1);
+        token.setKYCStatus(user2, true);
+    }
+
+    // Token Transfer Tests
+    function testTokenTransfer() public {
+        // Approve KYC for user1
+        token.setKYCStatus(user1, true);
+        
+        // Transfer token 0 to user1
+        token.transferFrom(admin, user1, 0);
+        assertEq(token.ownerOf(0), user1);
+    }
+
+    function testFailTransferToNonKYCUser() public {
+        vm.expectRevert("Recipient not KYC approved");
+        token.transferFrom(admin, user2, 0);
+    }
+
+    // Token Purchase Tests
+    function testPurchaseFraction() public {
+        // Setup
+        token.setKYCStatus(user1, true);
+        token.setTokenPrice(0, 1 ether);
+        
+        // Purchase
+        vm.prank(user1);
+        token.purchaseFraction{value: 1 ether}(0);
+        
+        assertEq(token.ownerOf(0), user1);
+    }
+
+    function testFailPurchaseInsufficientPayment() public {
+        token.setKYCStatus(user1, true);
+        token.setTokenPrice(0, 1 ether);
+        
+        vm.prank(user1);
+        token.purchaseFraction{value: 0.5 ether}(0);
+    }
+
+    // Rental Tests
+    function testRentAsset() public {
+        // Setup
+        uint256 rentDuration = 30; // 30 days
+        uint256 yearlyRent = 10 ether;
+        token.setYearlyRent(yearlyRent);
+        
+        uint256 expectedRent = (yearlyRent * rentDuration) / 365;
+        
+        vm.expectEmit(true, false, false, true);
+        emit PropertyRented(user1, block.timestamp, block.timestamp + (rentDuration * 1 days), expectedRent);
+        
+        vm.prank(user1);
+        token.rentAsset{value: expectedRent}(rentDuration);
+        
+        IRealEstateToken.PropertyDetails memory details = token.getAssetDetails();
+        assertTrue(details.isRented);
+    }
+
+    // Rent Distribution Tests
+    function testDistributeRent() public {
+        // Setup rental
+        uint256 rentDuration = 30;
+        uint256 yearlyRent = 10 ether;
+        token.setYearlyRent(yearlyRent);
+        
+        uint256 rentAmount = (yearlyRent * rentDuration) / 365;
+        
+        vm.prank(user1);
+        token.rentAsset{value: rentAmount}(rentDuration);
+        
+        // Fast forward to end of rental period
+        vm.warp(block.timestamp + (rentDuration * 1 days));
+        
+        // Record initial balances
+        uint256 initialBalance = address(admin).balance;
+        
+        // Distribute rent
+        token.distributeRent(0);
+        
+        // Verify distribution
+        uint256 expectedShare = (rentAmount * 90 / 100) / TOTAL_SHARES; // 90% after maintenance fee
+        assertGt(address(admin).balance, initialBalance);
+        
+        // Verify maintenance reserve
+        uint256 expectedMaintenanceReserve = rentAmount * 10 / 100; // 10% maintenance fee
+        assertEq(token.maintenanceReserve(), expectedMaintenanceReserve);
+    }
+
+    // Maintenance Fee Tests
+    function testWithdrawMaintenanceFee() public {
+        // Setup: First create some maintenance reserve through rent
+        uint256 rentDuration = 30;
+        uint256 yearlyRent = 10 ether;
+        token.setYearlyRent(yearlyRent);
+        
+        uint256 rentAmount = (yearlyRent * rentDuration) / 365;
+        
+        vm.prank(user1);
+        token.rentAsset{value: rentAmount}(rentDuration);
+        
+        // Fast forward and distribute rent to create maintenance reserve
+        vm.warp(block.timestamp + (rentDuration * 1 days));
+        token.distributeRent(0);
+        
+        // Grant property manager role
+        bytes32 propertyManagerRole = token.PROPERTY_MANAGER();
+        token.grantRole(propertyManagerRole, propertyManager);
+        
+        uint256 maintenanceReserve = token.maintenanceReserve();
+        uint256 withdrawAmount = maintenanceReserve / 2;
+        
+        vm.expectEmit(false, false, false, true);
+        emit MaintenanceFeeDeducted(withdrawAmount, "Regular maintenance");
+        
+        // Withdraw maintenance fee
+        vm.prank(propertyManager);
+        token.withdrawMaintenanceFee(withdrawAmount, "Regular maintenance");
+        
+        assertEq(token.maintenanceReserve(), maintenanceReserve - withdrawAmount);
+    }
+
+    // Pause/Unpause Tests
+    function testPauseUnpause() public {
+        token.pause();
+        assertTrue(token.paused());
+        
+        token.unpause();
+        assertFalse(token.paused());
+    }
+
+    function testFailTransferWhenPaused() public {
+        token.setKYCStatus(user1, true);
+        token.pause();
+        
+        vm.expectRevert("ERC721Pausable: token transfer while paused");
+        token.transferFrom(admin, user1, 0);
+    }
+
+    // Property Details Tests
+    function testUpdatePropertyDocumentURI() public {
+        string memory newURI = "ipfs://QmNewExample...";
+        token.updatePropertyDocumentURI(newURI);
+        
+        IRealEstateToken.PropertyDetails memory details = token.getAssetDetails();
+        assertEq(details.propertyDocumentURI, newURI);
+    }
+
+    // Gas Usage Tests
+    function testGasUsageForPurchase() public {
+        token.setKYCStatus(user1, true);
+        token.setTokenPrice(0, 1 ether);
+        
+        uint256 gasStart = gasleft();
+        vm.prank(user1);
+        token.purchaseFraction{value: 1 ether}(0);
+        uint256 gasUsed = gasStart - gasleft();
+        
+        emit log_named_uint("Gas used for purchase", gasUsed);
+    }
+
+    // Fuzz Tests
+    function testFuzz_SetTokenPrice(uint256 price) public {
+        vm.assume(price > 0 && price < 1000 ether);
+        
+        token.setTokenPrice(0, price);
+        assertEq(token.tokenPrices(0), price);
+    }
+
+    function testFuzz_RentDuration(uint256 duration) public {
+        vm.assume(duration > 0 && duration <= 365);
+        
+        token.setYearlyRent(10 ether);
+        uint256 rentAmount = (10 ether * duration) / 365;
+        
+        vm.deal(user1, rentAmount);
+        vm.prank(user1);
+        token.rentAsset{value: rentAmount}(duration);
+        
+        IRealEstateToken.RentPeriod memory rentPeriod = token.getRentPeriod(0);
+        assertEq(rentPeriod.endTime - rentPeriod.startTime, duration * 1 days);
+    }
+
+    // Helper function to receive ETH
+    receive() external payable {}
+}
+
+
+//////////////////////////////////////////////////////////////////////////////
+
+
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.8.0 <0.9.0;
+
+import {Test, console} from "../lib/forge-std/src/Test.sol";
+import "../src/RealEstateToken.sol";
+import "../src/RealEstateLoan.sol";
+import {DeployRealEstate} from "../script/DeployRealEstateToken.s.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+
+contract TestRealEstateToken is Test, IERC721Receiver {
+    RealEstateToken public token;
+    RealEstateLoan public loan;
+    DeployRealEstate public deployer;
+
+    address public admin;
+    address public user1;
+    address public user2;
+    address public propertyManager;
+    address public loanManager;
+
+    // Test Configuration
+    string constant propertyAddress = "123 Main St";
+    string constant description = "2 bedroom apartment";
+    uint256 constant totalShares = 100;
+    uint256 constant pricePerShare = 1 ether;
+    string constant propertyURI = "ipfs://QmExample...";
+
+    // Events
+    event KYCStatusUpdated(address indexed user, bool status);
+    event PropertyRented(address indexed tenant, uint256 startTime, uint256 endTime, uint256 amount);
+    event RentDistributed(uint256 totalAmount, uint256 timestamp);
+    event MaintenanceFeeDeducted(uint256 amount, string description);
+    event LoanProposed(uint256 indexed proposalId, address indexed borrower, uint256 requestedAmount);
+    event LoanApproved(uint256 indexed loanId, uint256 indexed proposalId, uint256 amount, uint256 interestRate);
+    event LoanRepaid(uint256 indexed loanId, uint256 amount);
+
+    receive() external payable {}
+
+    function setUp() public {
+        admin = address(this);
+        user1 = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
+        user2 = 0x70997970C51812dc3A010C7d01b50e0d17dc79C8;
+        propertyManager = address(0x03);
+        loanManager = address(0x04);
+
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
+        vm.deal(loanManager, 100 ether);
+
+        token = new RealEstateToken(
+            "123 Main St",
+            "A beautiful property",
+            100,
+            1 ether,
+            "ipfs://property-doc",
+            admin
+        );
+
+        loan = new RealEstateLoan(address(token));
+        
+        // Setup loan manager role
+        loan.grantRole(loan.LOAN_MANAGER(), loanManager);
+    }
+
+    // Existing tests remain the same...
+
+    // New Loan Contract Tests
+
+    function testLoanProposal() public {
+        // Setup
+        token.setKYCStatus(user1, true);
+        token.transferFrom(admin, user1, 0); // Transfer token 0 to user1
+        
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = 0;
+        
+        vm.startPrank(user1);
+        token.approve(address(loan), 0);
+        
+        vm.expectEmit(true, true, false, true);
+        emit LoanProposed(0, user1, 1 ether);
+        
+        loan.proposeLoan(tokenIds, 1 ether, 30 days);
+        vm.stopPrank();
+        
+        // Verify proposal
+        (address borrower,,,bool isActive) = loan.proposals(0);
+        assertEq(borrower, user1);
+        assertTrue(isActive);
+    }
+
+    function testLoanApproval() public {
+        // Setup loan proposal
+        token.setKYCStatus(user1, true);
+        token.transferFrom(admin, user1, 0);
+        
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = 0;
+        
+        vm.startPrank(user1);
+        token.approve(address(loan), 0);
+        loan.proposeLoan(tokenIds, 1 ether, 30 days);
+        vm.stopPrank();
+        
+        // Approve loan
+        vm.startPrank(loanManager);
+        vm.expectEmit(true, true, false, true);
+        emit LoanApproved(0, 0, 1 ether, 850);
+        
+        loan.approveLoan{value: 1 ether}(0, 850); // 8.50% interest rate
+        vm.stopPrank();
+        
+        // Verify loan
+        (address borrower,,,,,,,bool isActive,) = loan.loans(0);
+        assertEq(borrower, user1);
+        assertTrue(isActive);
+        assertEq(token.ownerOf(0), address(loan)); // Token transferred to contract
+    }
+
+    function testLoanRepayment() public {
+        // Setup and approve loan
+        testLoanApproval();
+        
+        // Advance time by 15 days
+        vm.warp(block.timestamp + 15 days);
+        
+        // Calculate and make repayment
+        uint256 totalDue = loan.calculateTotalDue(0);
+        
+        vm.startPrank(user1);
+        vm.expectEmit(true, false, false, true);
+        emit LoanRepaid(0, totalDue);
+        
+        loan.repayLoan{value: totalDue}(0);
+        vm.stopPrank();
+        
+        // Verify loan is closed and collateral returned
+        (,,,,,,,bool isActive,) = loan.loans(0);
+        assertFalse(isActive);
+        assertEq(token.ownerOf(0), user1); // Token returned to borrower
+    }
+
+    function testFailInvalidLoanDuration() public {
+        token.setKYCStatus(user1, true);
+        token.transferFrom(admin, user1, 0);
+        
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = 0;
+        
+        vm.startPrank(user1);
+        token.approve(address(loan), 0);
+        loan.proposeLoan(tokenIds, 1 ether, 5 days); // Duration too short
+        vm.stopPrank();
+    }
+
+    function testFailUnauthorizedLoanApproval() public {
+        // Setup loan proposal
+        testLoanProposal();
+        
+        // Try to approve loan from non-manager account
+        vm.prank(user2);
+        loan.approveLoan{value: 1 ether}(0, 850);
+    }
+
+    function testLoanLiquidation() public {
+        // Setup and approve loan
+        testLoanApproval();
+        
+        // Advance time beyond loan duration
+        vm.warp(block.timestamp + 31 days);
+        
+        vm.prank(loanManager);
+        loan.liquidateLoan(0);
+        
+        // Verify loan is liquidated
+        (,,,,,,, bool isActive, bool isLiquidated) = loan.loans(0);
+        assertFalse(isActive);
+        assertTrue(isLiquidated);
+        assertEq(token.ownerOf(0), loanManager); // Token transferred to loan manager
+    }
+
+    function testFailEarlyLiquidation() public {
+        // Setup and approve loan
+        testLoanApproval();
+        
+        // Try to liquidate before loan duration ends
+        vm.prank(loanManager);
+        loan.liquidateLoan(0);
+    }
+
+    function testFuzz_LoanAmount(uint256 amount) public {
+        vm.assume(amount > 0.1 ether && amount < 10 ether);
+        
+        // Setup
+        token.setKYCStatus(user1, true);
+        token.transferFrom(admin, user1, 0);
+        
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = 0;
+        
+        vm.startPrank(user1);
+        token.approve(address(loan), 0);
+        loan.proposeLoan(tokenIds, amount, 30 days);
+        vm.stopPrank();
+        
+        vm.startPrank(loanManager);
+        loan.approveLoan{value: amount}(0, 850);
+        vm.stopPrank();
+        
+        // Verify loan amount
+        (,, uint256 loanAmount,,,,,,) = loan.loans(0);
+        assertEq(loanAmount, amount);
+    }
+
+    // Maintain existing onERC721Received function
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external pure override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
